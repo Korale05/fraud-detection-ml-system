@@ -1,10 +1,12 @@
 import os
 import sys
 
+
 #adding project root
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0,project_root)
-
+from src.utils import load_pickle
+import pickle
 from src.exception import CustomException
 from src.logger import logging
 
@@ -22,6 +24,7 @@ from src.utils import save_obj
 @dataclass
 class DataTransformationConfig:
     preprocessor_obj_file_path = os.path.join('artifacts','preprocessor.pkl')
+    user_state_file_path = os.path.join('artifacts','user_state.pkl')
 
 class DataTransformation:
     """
@@ -44,45 +47,108 @@ class DataTransformation:
         
         try : 
             # Convert Timestamp to datetime first
+            df = df.sort_values("Timestamp")
             df['Timestamp'] = pd.to_datetime(df['Timestamp'])
-            if is_Training:
-                self.user_state={
-                    'user_transaction_count' : df.groupby('User_ID').size().to_dict(),
-                    'user_avg_amount' : df.groupby('User_ID')['Transaction_Amount'].mean().to_dict(),
-                    'user_amount_std' : df.groupby('User_ID')['Transaction_Amount'].std().fillna(0).to_dict(),
-                    'user_first_transaction' : df.groupby('User_ID')['Timestamp'].min().to_dict()
+            user_stats = {}
+
+            df['user_transaction_count'] = 0.0
+            df['user_avg_amount'] = 0.0
+            df['user_amount_std'] = 0.0
+            df['days_since_first_transaction'] = 0.0
+            df['is_unusual_spend'] = 0.0
+
+            for i, row in df.iterrows():
+                user = row['User_ID']
+                amount = row['Transaction_Amount']
+                t = row['Timestamp']
+                
+                if user not in user_stats:
+                    # first ever transaction
+                    user_stats[user] = {
+                        "amounts": [amount],
+                        "first_ts": t
+                    }
+                    
+                    df.at[i, 'user_transaction_count'] = 1
+                    df.at[i, 'user_avg_amount'] = amount
+                    df.at[i, 'user_amount_std'] = 0
+                    df.at[i, 'days_since_first_transaction'] = 0
+                
+                else:
+                    history = user_stats[user]["amounts"]
+                    first_ts = user_stats[user]["first_ts"]
+                    
+                    df.at[i, 'user_transaction_count'] = len(history) + 1
+                    df.at[i, 'user_avg_amount'] = np.mean(history)
+                    df.at[i, 'user_amount_std'] = np.std(history)
+                    df.at[i, 'days_since_first_transaction'] = (t - first_ts).total_seconds() / 86400
+                    
+                    # update history AFTER using it
+                    history.append(amount)
+            df['amount_deviation_from_user_avg'] = (
+                (df['Transaction_Amount'] - df['user_avg_amount']) / 
+                (df['user_amount_std'] + 1e-5)
+            )
+            df['is_unusual_spend'] = (df['amount_deviation_from_user_avg'] > 3).astype(int)
+
+            final_user_state = {
+                user: {
+                    "avg": np.mean(stats["amounts"]),
+                    "std": np.std(stats["amounts"]),
+                    "count": len(stats["amounts"]),
+                    "first_ts": stats["first_ts"]
                 }
-            # Apply feature
-            df['user_transaction_count'] = df['User_ID'].map(
-                self.user_state.get('user_transaction_count',{})
-            ).fillna(1)
+                for user, stats in user_stats.items()
+            }
 
-            df['user_avg_amount'] = df['User_ID'].map(
-                self.user_state.get('user_avg_amount',{})
-            ).fillna(df['Transaction_Amount'])
-            
-            df['user_amount_std'] = df['User_ID'].map(
-                self.user_state.get('user_amount_std',{})
-            ).fillna(0)
+            with open("artifacts/user_state.pkl", "wb") as f:
+                pickle.dump(final_user_state, f)
 
-            # Deviation from user's normal behavior
-            df['amount_deviation_from_user_avg'] = (df['Transaction_Amount'] - df['user_avg_amount']) / (df['user_amount_std']+1e-5)
-            df['amount_deviation_from_user_avg']  = df['amount_deviation_from_user_avg'].fillna(0)
-
-            df['user_first_tnx_data'] = df['User_ID'].map(
-                self.user_state.get('user_first_transaction',{})
-            ).fillna(df['Timestamp'])
-
-            df['days_since_first_transaction'] = ((df['Timestamp'] - df['user_first_tnx_data']).dt.total_seconds()/86400).fillna(0)
-
-            df = df.drop('user_first_tnx_data',axis=1)
-
-            return df
-        
+            return(
+                df
+            )
         except Exception as e:
 
             raise CustomException(e,sys)
-        
+    def create_user_features_inference(self, df):
+        df = df.copy()
+        df['Timestamp'] = pd.to_datetime(df['Timestamp'])
+
+        user_state = load_pickle(self.data_transformation_config.user_state_file_path)
+
+        df['user_transaction_count'] = 0.0
+        df['user_avg_amount'] = 0.0
+        df['user_amount_std'] = 0.0
+        df['days_since_first_transaction'] = 0.0
+        df['amount_deviation_from_user_avg'] = 0.0
+        for i ,row in df.iterrows():
+            user = row['User_ID']
+            amount = row['Transaction_Amount']
+            t = row['Timestamp']
+
+            if user in user_state:
+                s = user_state[user]
+                count = s["count"]
+                avg = s["avg"]
+                std = s["std"]
+                first_ts = s["first_ts"]
+                days = (t - first_ts).total_seconds() / 86400
+            else:
+                count = 1
+                avg = amount
+                std = 0
+                days = 0
+
+            deviation = (amount - avg) / (std + 1e-5)
+            df.loc[i,'user_transaction_count'] = count
+            df.loc[i, 'user_transaction_count'] = count
+            df.loc[i, 'user_avg_amount'] = avg
+            df.loc[i, 'user_amount_std'] = std
+            df.loc[i, 'days_since_first_transaction'] = days
+            df.loc[i, 'amount_deviation_from_user_avg'] = deviation
+        df['is_unusual_spend'] = (df['amount_deviation_from_user_avg'] > 3).astype(int)
+        return df
+
     def create_time_feature(self,df):
         """Extract TIme feature"""
         try :
@@ -116,12 +182,18 @@ class DataTransformation:
     
     def get_data_transform_obj(self,df):
         try : 
-            
-            cat_feature = df.select_dtypes(include='object').columns.tolist()
-            num_feature = df.select_dtypes(exclude='object').columns.tolist()
+            cat_feature = list()
+            num_feature = list()
 
-            num_feature = [col for col in num_feature if col !='Fraud_Label']
-            
+            for i in df.columns:
+                if i == 'Fraud_Label':
+                    continue
+                if df[i].nunique() <= 15:
+                    cat_feature.append(i)
+                else:
+                    num_feature.append(i)
+
+            cat_feature =[col for col in cat_feature if col !='Fraud_Label']
             logging.info(f"Categorical_feature : {cat_feature}")
 
             logging.info(f"Numerical Feature : {num_feature}")
@@ -144,7 +216,8 @@ class DataTransformation:
                 [
                     ('num_pipline',num_pipline,num_feature),
                     ("cat pipline",cat_pipline,cat_feature)
-                ]
+                ],
+                sparse_threshold=0
             )
 
             logging.info("Preprocessing pipline is created")
@@ -161,12 +234,12 @@ class DataTransformation:
             logging.info("Reading Traning and Test data")
 
             #Creating featur for train data
-            train_df = self.create_user_feature(train_df,is_Training=True)
+            train_df = self.create_user_feature(train_df)
             train_df = self.create_time_feature(train_df)
             train_df = self.remove_unnecessary_column(train_df)
 
             #Create feature for test data
-            test_df = self.create_user_feature(test_df,is_Training=True)
+            test_df = self.create_user_features_inference(test_df)
             test_df = self.create_time_feature(test_df)
             test_df = self.remove_unnecessary_column(test_df)
 
@@ -187,6 +260,7 @@ class DataTransformation:
             input_feature_train_arr = preprocessing_obj.fit_transform(input_feature_train_df)
             input_feature_test_arr = preprocessing_obj.transform(input_feature_test_df)
 
+             
             #Combine the features and target
             train_arr = np.c_[
                 input_feature_train_arr,np.array(target_feature_train_df)

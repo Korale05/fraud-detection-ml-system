@@ -7,3 +7,5 @@ dill
 flask
 streamlit
 catboost
+tensorflow
+imblearn

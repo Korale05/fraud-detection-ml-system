@@ -5,6 +5,7 @@ import sys
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0,project_root)
 
+
 from src.exception import CustomException
 from src.logger import logging
 
@@ -12,7 +13,7 @@ import pandas as pd
 import numpy as np
 from sklearn.model_selection import train_test_split
 from dataclasses import dataclass
-
+from src.components.model_trainer import ModleTrainer
 from src.components.data_transformation import DataTransformation,DataTransformationConfig
 @dataclass
 class DataIngestionConfig:
@@ -23,10 +24,31 @@ class DataIngestionConfig:
 class DataIngestion:
     def __init__(self):
         self.inguestion_config = DataIngestionConfig()
+    def remove_lekage_column(slef,df):
+        """
+        Remove columns that contain data leakage
+        """
+        try:
+            leakage_columns = [
+                'Previous_Fraudulent_Activity',  # Future information
+                'Failed_Transaction_Count_7d',   # Includes future transactions
+                'Risk_Score',                     # Calculated using fraud labels
+                'IP_Address_Flag'                # Likely calculated using fraud patterns
+            ]
+            df = df.drop(columns = leakage_columns)
+            return df
+        except Exception as e:
+            raise CustomException(e,sys)
+        
+
     def initiate_data_ingestion(self):
         logging.info("Inititate the data ingestion")
         try:
             df = pd.read_csv(r"notebook\data\dataset.csv")
+
+            logging.info("Removing Lekage column")
+
+            df = self.remove_lekage_column(df)
 
             logging.info("Converting Raw data into data frame")
 
@@ -57,6 +79,8 @@ class DataIngestion:
 
 if __name__=='__main__':
     obj = DataIngestion()
-    train_set,test_set = obj.initiate_data_ingestion()
+    train_path,test_path = obj.initiate_data_ingestion()
     obj2= DataTransformation()
-    train_arr,test_arr,_ = obj2.initiate_data_transformation(train_set,test_set)
+    train_arr,test_arr,_ = obj2.initiate_data_transformation(train_path,test_path)
+    obj3 = ModleTrainer()
+    evaluation_report = obj3.initiate_model_training(train_arr,test_arr)
